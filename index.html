@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang=\"es\">
+<head>
+<meta charset=\"utf-8\"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"/>
+<title>Cerdo & Bellotas — Pixel v4</title>
+<meta name=\"theme-color\" content=\"#0e1020\"/>
+<style>
+  html,body{height:100%;margin:0;background:#0f1122;color:#eef1ff;font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial}
+  .wrap{max-width:980px;margin:0 auto;padding:12px}
+  .top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .btn{border:1px solid #2a3150;background:#1a1f34;color:#eef1ff;border-radius:10px;padding:8px 10px;cursor:pointer}
+  .stage{border:1px solid #2a3150;border-radius:12px;overflow:hidden;margin-top:8px}
+  canvas{display:block;width:100%;height:auto;image-rendering:pixelated;touch-action:none;background:linear-gradient(180deg,#151a2b,#0f1224)}
+  .pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}
+  .pad img{width:100%;max-width:220px;border:1px solid #2a3150;border-radius:10px;background:#18203a}
+  .badge{padding:6px 10px;border:1px solid #2a3150;border-radius:999px;color:#b9bde6}
+</style>
+</head>
+<body>
+<div class=\"wrap\">
+  <div class=\"top\">
+    <div>🐷 <strong>Cerdo & Bellotas — Pixel v4</strong></div>
+    <div>
+      <button id=\"play\" class=\"btn\">▶️ Jugar</button>
+      <button id=\"pause\" class=\"btn\">⏸️ Pausa</button>
+      <button id=\"sound\" class=\"btn\">🔊 Sonido</button>
+      <span class=\"badge\">Puntos: <b id=\"score\">0</b></span>
+      <span class=\"badge\">Récord: <b id=\"best\">0</b></span>
+    </div>
+  </div>
+  <div class=\"stage\"><canvas id=\"game\" width=\"960\" height=\"540\"></canvas></div>
+  <div class=\"pad\">
+    <img id=\"left\" src=\"assets/btn_left.png\" alt=\"izquierda\"/>
+    <img id=\"jump\" src=\"assets/btn_jump.png\" alt=\"saltar\"/>
+    <img id=\"right\" src=\"assets/btn_right.png\" alt=\"derecha\"/>
+  </div>
+</div>
+
+<script>
+
+(()=>{
+  const cvs=document.getElementById('game'), ctx=cvs.getContext('2d');
+  const W=cvs.width, H=cvs.height;
+  const play=document.getElementById('play'), pause=document.getElementById('pause'), snd=document.getElementById('sound');
+  const left=document.getElementById('left'), right=document.getElementById('right'), jump=document.getElementById('jump');
+  const scoreEl=document.getElementById('score'), bestEl=document.getElementById('best');
+
+  const A=(p)=>'assets/'+p;
+  const img={
+    pigIdle:new Image(), pigW1:new Image(), pigW2:new Image(), pigJump:new Image(),
+    acorn:new Image(), tile:new Image(), plat:new Image(), bush:new Image(), rock:new Image(),
+    hedge:new Image(), bgFar:new Image(), bgMid:new Image()
+  };
+  img.pigIdle.src=A('pig_idle.png'); img.pigW1.src=A('pig_walk1.png'); img.pigW2.src=A('pig_walk2.png'); img.pigJump.src=A('pig_jump.png');
+  img.acorn.src=A('acorn.png'); img.tile.src=A('tile_grass.png'); img.plat.src=A('platform.png'); img.bush.src=A('bush.png'); img.rock.src=A('rock.png');
+  img.hedge.src=A('enemy_hedgehog.png'); img.bgFar.src=A('bg_far.png'); img.bgMid.src=A('bg_mid.png');
+
+  let running=false, paused=false, t=0, last=0;
+  let score=0, best=Number(localStorage.getItem('pig_pixel_best')||0); bestEl.textContent=best;
+  let audioOn=true, actx=null;
+  const GRAV=1800, JUMP=-620, ACC=2200, FG=0.9, FA=0.985, MAX_VX=360;
+  let camX=0, camT=0;
+  const TILE_W=32*4, TILE_H=16*4;
+
+  function groundAt(x){ return H-140 + Math.sin((x+400)*0.001)*10 + Math.cos(x*0.0006)*12; }
+
+  const world={spawn:400, acorns:[], obst:[], plats:[]};
+  function rand(a,b){ return Math.random()*(b-a)+a; }
+  function ensureAhead(dist=2400){
+    const end=camX+dist;
+    while(world.spawn<end){
+      const seg=rand(320,560), base=world.spawn+seg*0.15;
+      if(Math.random()<0.7){
+        const px=base+rand(40,seg-200), py=groundAt(px)-rand(110,200);
+        world.plats.push({x:px,y:py,w:48*4});
+        world.acorns.push({x:px+96, y:py-40, t:false});
+      }
+      if(Math.random()<0.5){
+        const ex=base+rand(60,seg-60);
+        world.obst.push({x:ex,type:'hedge',dir:Math.random()<0.5?-1:1, ph:Math.random()*6.28});
+      }
+      const n=2+Math.floor(Math.random()*3);
+      for(let i=0;i<n;i++) world.acorns.push({x:base+rand(30,seg-30), y:-rand(30,90), t:false});
+      world.spawn+=seg;
+    }
+    const minX=camX-800;
+    world.plats=world.plats.filter(p=>p.x+p.w>minX);
+    world.acorns=world.acorns.filter(a=>!a.t || a.x>minX);
+    world.obst=world.obst.filter(o=>o.x>minX);
+  }
+
+  const pig={x:60,y:groundAt(60)-80,vx:0,vy:0,on:true,face:1,state:'idle'};
+
+  const input={left:false,right:false,jump:false}; let coyote=0, jbuf=0;
+  function setKey(k,v){ if(k==='left') input.left=v; if(k==='right') input.right=v; if(k==='jump'){ if(v){input.jump=true;jbuf=0.12;} else input.jump=false; } }
+  addEventListener('keydown',e=>{const k=e.key.toLowerCase();
+    if(k==='arrowleft'||k==='a') setKey('left',true);
+    if(k==='arrowright'||k==='d') setKey('right',true);
+    if(k===' '||k==='arrowup'||k==='w'){ setKey('jump',true); e.preventDefault(); }});
+  addEventListener('keyup',e=>{const k=e.key.toLowerCase();
+    if(k==='arrowleft'||k==='a') setKey('left',false);
+    if(k==='arrowright'||k==='d') setKey('right',false);
+    if(k===' '||k==='arrowup'||k==='w') setKey('jump',false);});
+  ['mousedown','touchstart'].forEach(ev=>{
+    left.addEventListener(ev,e=>{e.preventDefault();setKey('left',true)},{passive:false});
+    right.addEventListener(ev,e=>{e.preventDefault();setKey('right',true)},{passive:false});
+    jump.addEventListener(ev,e=>{e.preventDefault();setKey('jump',true)},{passive:false});
+  });
+  ['mouseup','touchend','touchcancel'].forEach(ev=>{
+    left.addEventListener(ev,()=>setKey('left',false));
+    right.addEventListener(ev,()=>setKey('right',false));
+    jump.addEventListener(ev,()=>setKey('jump',false));
+  });
+
+  function oing(){ if(!audioOn) return; try{
+    if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)();
+    const a=actx, d=.2, o1=a.createOscillator(), o2=a.createOscillator(), g=a.createGain();
+    const t=a.currentTime, T=t+d; o1.type='square'; o2.type='sine';
+    o1.frequency.setValueAtTime(180,t); o1.frequency.exponentialRampToValueAtTime(80,T);
+    o2.frequency.setValueAtTime(240,t); o2.frequency.exponentialRampToValueAtTime(110,T);
+    g.gain.setValueAtTime(.0001,t); g.gain.exponentialRampToValueAtTime(.35,t+.03); g.gain.exponentialRampToValueAtTime(.0001,T);
+    o1.connect(g); o2.connect(g); g.connect(a.destination); o1.start(t); o2.start(t); o1.stop(T); o2.stop(T);
+    if(navigator.vibrate) navigator.vibrate(20);
+  }catch(e){} }
+
+  function collidePlats(px,py, vy){
+    for(const p of world.plats){
+      if(px>p.x-60 && px<p.x+p.w+60){
+        if(py+80 <= p.y && py+80+vy*dt >= p.y-2) return p.y-80;
+      }
+    } return null;
+  }
+
+  let dt=0.016;
+  function step(dt){
+    if(input.left) pig.vx -= ACC*dt;
+    if(input.right) pig.vx += ACC*dt;
+    pig.vx *= pig.on?FG:FA; pig.vx=Math.max(-MAX_VX, Math.min(MAX_VX, pig.vx));
+    if(Math.abs(pig.vx)>5) pig.face = pig.vx>0?1:-1;
+    pig.vy += GRAV*dt;
+    if(pig.on) coyote=0.12; else coyote=Math.max(0,coyote-dt);
+    jbuf=Math.max(0,jbuf-dt);
+    if(jbuf>0 && coyote>0){ pig.vy=JUMP; pig.on=false; jbuf=0; coyote=0; }
+    pig.x += pig.vx*dt; pig.y += pig.vy*dt;
+    const gy = groundAt(pig.x);
+    let target = gy;
+    const py = collidePlats(pig.x,pig.y,pig.vy);
+    if(py!==null) target = py;
+    if(pig.y+80 >= target){ pig.y=target-80; pig.vy=0; pig.on=true; } else pig.on=false;
+    pig.state = !pig.on ? 'jump' : (Math.abs(pig.vx)>60?'walk':'idle');
+    camT = Math.max(0, pig.x - W*0.35); camX += (camT-camX)*0.08;
+    ensureAhead(2200);
+    for(const a of world.acorns){
+      if(a.t) continue; const ax=a.x, ay=groundAt(ax)+a.y; const dx=pig.x-ax, dy=pig.y-ay;
+      if(dx*dx+dy*dy < 60*60){ a.t=true; score++; scoreEl.textContent=score; if(score>best){best=score; localStorage.setItem('pig_pixel_best',best); bestEl.textContent=best;} oing(); }
+    }
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    const farX=-(camX*0.2)%img.bgFar.width; const midX=-(camX*0.4)%img.bgMid.width;
+    for(let x=farX-img.bgFar.width; x<W; x+=img.bgFar.width) ctx.drawImage(img.bgFar, x, 0, img.bgFar.width, 64*4);
+    for(let x=midX-img.bgMid.width; x<W; x+=img.bgMid.width) ctx.drawImage(img.bgMid, x, 96, img.bgMid.width, 64*4);
+    const start=Math.floor((camX-200)/(32*4))-1, end=start+Math.ceil(W/(32*4))+3;
+    for(let i=start;i<end;i++){ const gx=i*(32*4) - camX, gy=groundAt(i*(32*4)); ctx.drawImage(img.tile, gx, gy-16*4, 32*4, 16*4); }
+    for(const p of world.plats){ const x=p.x - camX; ctx.drawImage(img.plat, x, p.y-16*4, 48*4, 16*4); }
+    for(const o of world.obst){ const x=o.x - camX, y=groundAt(o.x); ctx.save(); ctx.translate(x, y-24*4); ctx.scale(o.dir,1); ctx.drawImage(img.hedge, -16*4, -8*4, 32*4,24*4); ctx.restore(); }
+    for(const a of world.acorns){ if(a.t) continue; const x=a.x - camX, y=groundAt(a.x)+a.y; ctx.drawImage(img.acorn, x-8*4, y-8*4, 16*4,16*4); }
+    let sprite = pig.state==='jump'?img.pigJump : (Math.floor(performance.now()/120)%2===0?img.pigW1:img.pigW2);
+    if(pig.state==='idle') sprite=img.pigIdle;
+    const sx=pig.x - camX, sy=pig.y; ctx.save(); ctx.translate(sx,sy); ctx.scale(pig.face,1); ctx.drawImage(sprite, -16*4, -16*4, 32*4,32*4); ctx.restore();
+  }
+
+  let camX=0, camT=0; let dt=0.016, last=0;
+  function loop(ts){
+    if(!running){ draw(); return; }
+    if(paused){ draw(); return requestAnimationFrame(loop); }
+    if(!last) last=ts; dt=(ts-last)/1000; last=ts; if(dt>0.05) dt=0.05;
+    step(dt); draw(); requestAnimationFrame(loop);
+  }
+
+  play.onclick=()=>{ running=true; paused=false; last=0; score=0; scoreEl.textContent=0; camX=0; world.spawn=400; world.acorns=[]; world.obst=[]; world.plats=[]; pig.x=60; pig.y=groundAt(60)-80; pig.vx=pig.vy=0; requestAnimationFrame(loop); };
+  pause.onclick=()=>{ if(!running) return; paused=!paused; };
+  snd.onclick=()=>{ audioOn=!audioOn; snd.textContent=audioOn?'🔊 Sonido':'🔇 Silencio'; };
+
+  draw();
+})();
+
+</script>
+</body>
+</html>
